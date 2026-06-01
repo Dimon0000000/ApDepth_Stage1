@@ -11,8 +11,8 @@ If you are experienced with PyTorch and have already installed it, just skip thi
 **Step 1.** Create a conda environment and activate it.
 
 ```shell
-conda create --name depthmaster python==3.10
-conda activate depthmaster
+conda create --name apdepth python==3.10
+conda activate apdepth
 ```
 
 **Step 2.** Install PyTorch following [official instructions](https://pytorch.org/get-started/locally/), e.g.
@@ -30,8 +30,8 @@ We recommend that users follow our practices for installation.
 **Step 1.** Clone repository.
 
 ```shell
-git clone https://github.com/indu1ge/DepthMaster.git
-cd DepthMaster
+git clone https://github.com/Haruko386/ApDepth_Stage1.git
+cd ApDepth_Stage1
 ```
 
 **Step 2.** Install requirements.
@@ -45,7 +45,7 @@ pip3 install h5py scikit-image tqdm bitsandbytes wandb tabulate
 
 ```
 
-Download checkpoints for [Stable Diffusion v2](https://huggingface.co/stabilityai/stable-diffusion-2/tree/main).
+Download checkpoints for [Stable Diffusion v2](https://huggingface.co/sd2-community/stable-diffusion-2).
 <!-- ```shell
 mkdir ckpt
 cd ckpt

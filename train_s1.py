@@ -1,6 +1,6 @@
 # Last modified: 2025-07-13
 #
-# Copyright 2025 Ziyang Song, USTC. All rights reserved.
+# Copyright 2025 Jiawei Wang, SJZU. All rights reserved.
 #
 # This file has been modified from the original version.
 # Original copyright (c) 2023 Bingxin Ke, ETH Zurich. All rights reserved.
@@ -18,8 +18,8 @@
 # limitations under the License.
 # --------------------------------------------------------------------------
 # If you find this code useful, we kindly ask you to cite our paper in your work.
-# Please find bibtex at: https://github.com/indu1ge/DepthMaster#-citation
-# More information about the method can be found at https://indu1ge.github.io/DepthMaster_page
+# Please find bibtex at: https://github.com/Haruko386/ApDepth#-citation
+# More information about the method can be found at https://haruko386.github.io/apdepth
 # --------------------------------------------------------------------------
 
 import argparse
@@ -35,8 +35,8 @@ from torch.utils.data import ConcatDataset, DataLoader
 from tqdm import tqdm
 
 
-from depthmaster import DepthMasterPipeline
-from depthmaster.modules.unet_2d_condition_s1 import UNet2DConditionModel
+from apdepth import ApDepthPipeline
+from apdepth.modules.unet_2d_condition_s1 import UNet2DConditionModel
 from src.dataset import BaseDepthDataset, DatasetMode, get_dataset
 from src.dataset.mixed_sampler import MixedBatchSampler
 from src.trainer import get_trainer_cls
@@ -67,7 +67,7 @@ if "__main__" == __name__:
     parser.add_argument(
         "--config",
         type=str,
-        default="config/train.yaml",
+        default="config/train_s1.yaml",
         help="Path to config file.",
     )
     parser.add_argument(
@@ -93,12 +93,12 @@ if "__main__" == __name__:
         help="On Slurm cluster, do not copy data to local scratch",
     )
     parser.add_argument(
-        "--base_data_dir", type=str, default=None, help="directory of training data"
+        "--base_data_dir", type=str, default="/root/Dataset", help="directory of training data"
     )
     parser.add_argument(
         "--base_ckpt_dir",
         type=str,
-        default=None,
+        default="/root/ApDepth_Stage1/pretrained_checkpoint",
         help="directory of pretrained checkpoint",
     )
     parser.add_argument(
@@ -108,6 +108,10 @@ if "__main__" == __name__:
     )
 
     args = parser.parse_args()
+    print("\n=== Arguments Summary ===")
+    max_len = max(len(arg) for arg in vars(args))  # 计算最长的参数名用于对齐
+    for arg in vars(args):
+        print(f"{arg.ljust(max_len)} : {getattr(args, arg)}")
     resume_run = args.resume_run
     output_dir = args.output_dir
     base_data_dir = (
@@ -139,7 +143,7 @@ if "__main__" == __name__:
             job_name = os.path.basename(args.config)
         else:
             job_name = os.path.basename(args.config).split(".")[0]
-            out_dir_run = os.path.join("./log", job_name)
+            out_dir_run = os.path.join("./output", job_name)
         os.makedirs(out_dir_run, exist_ok=False)
 
     cfg_data = cfg.dataset
@@ -163,26 +167,26 @@ if "__main__" == __name__:
     logging.debug(f"config: {cfg}")
 
     # Initialize wandb
-    if not args.no_wandb:
-        if resume_run is not None:
-            wandb_id = load_wandb_job_id(out_dir_run)
-            wandb_cfg_dic = {
-                "id": wandb_id,
-                "resume": "must",
-                **cfg.wandb,
-            }
-        else:
-            wandb_cfg_dic = {
-                "config": dict(cfg),
-                "name": job_name,
-                "mode": "online",
-                **cfg.wandb,
-            }
-        wandb_cfg_dic.update({"dir": out_dir_run})
-        wandb_run = init_wandb(enable=True, **wandb_cfg_dic)
-        save_wandb_job_id(wandb_run, out_dir_run)
-    else:
-        init_wandb(enable=False)
+    # if not args.no_wandb:
+    #     if resume_run is not None:
+    #         wandb_id = load_wandb_job_id(out_dir_run)
+    #         wandb_cfg_dic = {
+    #             "id": wandb_id,
+    #             "resume": "must",
+    #             **cfg.wandb,
+    #         }
+    #     else:
+    #         wandb_cfg_dic = {
+    #             "config": dict(cfg),
+    #             "name": job_name,
+    #             "mode": "online",
+    #             **cfg.wandb,
+    #         }
+    #     wandb_cfg_dic.update({"dir": out_dir_run})
+    #     wandb_run = init_wandb(enable=True, **wandb_cfg_dic)
+    #     save_wandb_job_id(wandb_run, out_dir_run)
+    # else:
+    #     init_wandb(enable=False)
 
     # Tensorboard (should be initialized after wandb)
     tb_logger.set_dir(out_dir_tb)
@@ -214,7 +218,7 @@ if "__main__" == __name__:
     if is_on_slurm() and (not args.do_not_copy_data):
         # local scratch dir
         original_data_dir = base_data_dir
-        base_data_dir = os.path.join(get_local_scratch_dir(), "Marigold_data")
+        base_data_dir = os.path.join(get_local_scratch_dir(), "ApDepth_data")
         # copy data
         required_data_list = find_value_in_omegaconf("dir", cfg_data)
         required_data_list = list(set(required_data_list))
@@ -285,46 +289,14 @@ if "__main__" == __name__:
             shuffle=True,
             generator=loader_generator,
         )
-    # Validation dataset
-    val_loaders: List[DataLoader] = []
-    for _val_dic in cfg_data.val:
-        _val_dataset = get_dataset(
-            _val_dic,
-            base_data_dir=base_data_dir,
-            mode=DatasetMode.EVAL,
-        )
-        _val_loader = DataLoader(
-            dataset=_val_dataset,
-            batch_size=1,
-            shuffle=False,
-            num_workers=cfg.dataloader.num_workers,
-        )
-        val_loaders.append(_val_loader)
-
-    # Visualization dataset
-    vis_loaders: List[DataLoader] = []
-    for _vis_dic in cfg_data.vis:
-        _vis_dataset = get_dataset(
-            _vis_dic,
-            base_data_dir=base_data_dir,
-            mode=DatasetMode.EVAL,
-        )
-        _vis_loader = DataLoader(
-            dataset=_vis_dataset,
-            batch_size=1,
-            shuffle=False,
-            num_workers=cfg.dataloader.num_workers,
-        )
-        vis_loaders.append(_vis_loader)
 
     # -------------------- Model --------------------
     _pipeline_kwargs = cfg.pipeline.kwargs if cfg.pipeline.kwargs is not None else {}
-    model = DepthMasterPipeline.from_pretrained(
+    model = ApDepthPipeline.from_pretrained(
         os.path.join(base_ckpt_dir, cfg.model.pretrained_path), **_pipeline_kwargs
     )
     unet = UNet2DConditionModel.from_pretrained(os.path.join(base_ckpt_dir, cfg.model.pretrained_path, f'unet'))
     model.unet = unet
-
 
     # -------------------- Trainer --------------------
     # Exit time
@@ -346,8 +318,6 @@ if "__main__" == __name__:
         out_dir_eval=out_dir_eval,
         out_dir_vis=out_dir_vis,
         accumulation_steps=accumulation_steps,
-        val_dataloaders=val_loaders,
-        vis_dataloaders=vis_loaders,
     )
 
     # -------------------- Checkpoint --------------------

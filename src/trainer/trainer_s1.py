@@ -1,6 +1,6 @@
 # Last modified: 2025-07-13
 #
-# Copyright 2025 Ziyang Song, USTC. All rights reserved.
+# Copyright 2025 Jiawei Wang, SJZU. All rights reserved.
 #
 # This file has been modified from the original version.
 # Original copyright (c) 2023 Bingxin Ke, ETH Zurich. All rights reserved.
@@ -18,8 +18,8 @@
 # limitations under the License.
 # --------------------------------------------------------------------------
 # If you find this code useful, we kindly ask you to cite our paper in your work.
-# Please find bibtex at: https://github.com/indu1ge/DepthMaster#-citation
-# More information about the method can be found at https://indu1ge.github.io/DepthMaster_page
+# Please find bibtex at: https://github.com/Haruko386/ApDepth#-citation
+# More information about the method can be found at https://haruko386.github.io/apdepth
 # --------------------------------------------------------------------------
 import logging
 import os
@@ -30,6 +30,8 @@ from typing import List, Union
 
 import numpy as np
 import torch
+from torch.nn import Conv2d
+from torch.nn.parameter import Parameter
 from omegaconf import OmegaConf
 from torch.optim import Adam
 from torch.optim.lr_scheduler import LambdaLR
@@ -38,7 +40,7 @@ from tqdm import tqdm
 from PIL import Image
 import torch.nn.functional as F
 
-from depthmaster import DepthMasterPipeline, DepthMasterDepthOutput
+from apdepth import ApDepthPipeline, ApDepthDepthOutput
 from src.util import metric
 from src.util.data_loader import skip_first_batches
 from src.util.logging_util import tb_logger, eval_dic_to_text
@@ -58,11 +60,11 @@ from external_encoder.dinov2.dinov2 import DINOv2
 IMAGENET_DEFAULT_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_DEFAULT_STD = (0.229, 0.224, 0.225)
 
-class DepthMasterTrainerS1:
+class ApDepthTrainerS1:
     def __init__(
         self,
         cfg: OmegaConf,
-        model: DepthMasterPipeline,
+        model: ApDepthPipeline,
         train_dataloader: DataLoader,
         device,
         base_ckpt_dir,
@@ -74,7 +76,7 @@ class DepthMasterTrainerS1:
         vis_dataloaders: List[DataLoader] = None,
     ):
         self.cfg: OmegaConf = cfg
-        self.model: DepthMasterPipeline = model
+        self.model: ApDepthPipeline = model
         self.device = device
         self.seed: Union[int, None] = (
             self.cfg.trainer.init_seed
@@ -86,6 +88,7 @@ class DepthMasterTrainerS1:
         self.val_loaders: List[DataLoader] = val_dataloaders
         self.vis_loaders: List[DataLoader] = vis_dataloaders
         self.accumulation_steps: int = accumulation_steps
+        self.base_ckpt_dir = base_ckpt_dir
 
 
         # Encode empty text prompt
@@ -96,7 +99,13 @@ class DepthMasterTrainerS1:
         # Initialize DINOv2 encoder
         self.dinov2_encoder = DINOv2(model_name='vitg')
         dinov2_encoder_dict = self.dinov2_encoder.state_dict()
-        pretrained_ckpt_dict = torch.load(f'checkpoints/depth_anything_v2_vitg.pth', map_location='cpu')
+        dinov2_ckpt_path = self._resolve_ckpt_path(
+            self.cfg.trainer.get(
+                "dinov2_pretrained_path",
+                "DA2/checkpoints/depth_anything_v2_vitg.pth",
+            )
+        )
+        pretrained_ckpt_dict = torch.load(dinov2_ckpt_path, map_location='cpu')
         pretrained_dict = {k.replace('pretrained.', ''): v for k, v in pretrained_ckpt_dict.items() if k.replace('pretrained.', '') in dinov2_encoder_dict}
         self.dinov2_encoder.load_state_dict(pretrained_dict)
         del self.dinov2_encoder.head
@@ -105,7 +114,7 @@ class DepthMasterTrainerS1:
 
 
         # Initialize adapter to align the feat dimension of SD and DINOv2
-        self.dinov2_adapter = build_conv_adapter(in_channels=1280, out_channels=1536, hidden_channels=1280)
+        self.dinov2_adapter = build_conv_adapter(in_channels=1280, out_channels=1536, hidden_channels=1536)
 
 
         # Trainability
@@ -146,6 +155,9 @@ class DepthMasterTrainerS1:
         ), f"Main eval metric `{self.main_val_metric}` not found in evaluation metrics."
         self.best_metric = 1e8 if "minimize" == self.main_val_metric_goal else -1e8
 
+        if 8 != self.model.unet.config["in_channels"]:
+            self._replace_unet_conv_in()
+
         # Settings
         self.max_epoch = self.cfg.max_epoch
         self.max_iter = self.cfg.max_iter
@@ -164,21 +176,43 @@ class DepthMasterTrainerS1:
         self.in_evaluation = False
         self.global_seed_sequence: List = []  # consistent global seed sequence, used to seed random generator, to ensure consistency when resuming
 
+    def _replace_unet_conv_in(self):
+            # replace the first layer to accept 8 in_channels
+            _weight = self.model.unet.conv_in.weight.clone()  # [320, 4, 3, 3]
+            _bias = self.model.unet.conv_in.bias.clone()  # [320]
+            _weight = _weight.repeat((1, 2, 1, 1))  # Keep selected channel(s)
+            # half the activation magnitude
+            _weight *= 0.5
+            # new conv_in channel
+            _n_convin_out_channel = self.model.unet.conv_in.out_channels
+            _new_conv_in = Conv2d(
+                8, _n_convin_out_channel, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1)
+            )
+            _new_conv_in.weight = Parameter(_weight)
+            _new_conv_in.bias = Parameter(_bias)
+            self.model.unet.conv_in = _new_conv_in
+            logging.info("Unet conv_in layer is replaced")
+            # replace config
+            self.model.unet.config["in_channels"] = 8
+            logging.info("Unet config is updated")
+            return
     
     def train(self, t_end=None):
         logging.info("Start training")
 
         device = self.device
         self.model.to(device)
+        if getattr(self.model, "da2", None) is not None:
+            self.model.da2.to(device)
         self.dinov2_encoder.to(device)
         self.dinov2_adapter.to(device)
-        self.visualize()
+        # self.visualize()
 
-        if self.in_evaluation:
-            logging.info(
-                "Last evaluation was not finished, will do evaluation before continue training."
-            )
-            self.validate()
+        # if self.in_evaluation:
+        #     logging.info(
+        #         "Last evaluation was not finished, will do evaluation before continue training."
+        #     )
+        #     self.validate()
 
         self.train_metrics.reset()
         accumulated_step = 0
@@ -203,6 +237,7 @@ class DepthMasterTrainerS1:
                 # Get data
                 rgb = batch["rgb_norm"].to(device)
                 depth_gt_for_latent = batch[self.gt_depth_type].to(device)
+                da2_depth = self.model.da2.infer_batch(rgb).to(device)
 
                 if self.gt_mask_type is not None:
                     valid_mask_for_latent = batch[self.gt_mask_type].to(device)
@@ -223,6 +258,7 @@ class DepthMasterTrainerS1:
                     gt_depth_latent = self.encode_depth(
                         depth_gt_for_latent
                     )  # [B, 4, h, w]
+                    da2_depth_latent = self.model.encode_rgb(da2_depth)
                     # DINOv2 feat
                     dinov2_input_rgb = Normalize(IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD)(rgb)
                     dinov2_input_rgb = F.interpolate(dinov2_input_rgb, scale_factor=0.875, mode='bicubic')
@@ -233,9 +269,13 @@ class DepthMasterTrainerS1:
                     (batch_size, 1, 1)
                 )  # [B, 77, 1024]
 
+                unet_input = torch.cat(
+                    [rgb_latent, da2_depth_latent], dim=1
+                )
+
                 # Predict the noise residual
                 rgb_latent = self.model.unet(
-                    rgb_latent, 1, text_embed
+                    unet_input, 1, text_embed
                 )  # [B, 4, h, w]
 
                 feat_16 = rgb_latent.feat_64
@@ -267,14 +307,12 @@ class DepthMasterTrainerS1:
                 dinov2_z = dinov2_z.reshape(b, dinov2_spatial_dim_h, dinov2_spatial_dim_w, -1).permute(0, 3, 1, 2)
                 dinov2_z = F.interpolate(dinov2_z, size=(h, w), mode='bicubic', align_corners=False)
 
-                # 1. 归一化 (L2 Normalize)
-                # dim=1 是 channel 维度
+                # (L2 Normalize)
                 unet_feat_norm = F.normalize(unet_feat_aligned, dim=1, p=2)
-                dinov2_feat_norm = F.normalize(dinov2_z.detach(), dim=1, p=2) # Detach DINOv2，不传梯度
+                dinov2_feat_norm = F.normalize(dinov2_z.detach(), dim=1, p=2) # Detach DINOv2
 
-                # 2. 计算余弦相似度
-                # cosine_similarity 输出 shape [B, H, W]
-                # 我们希望最大化相似度，所以 Loss = 1 - Cosine
+                # cosine_similarity
+                # 最大化相似度，所以 Loss = 1 - Cosine
                 loss_feat_align = (1.0 - F.cosine_similarity(unet_feat_norm, dinov2_feat_norm, dim=1)).mean()
 
                 self.train_metrics.update("feat_align_loss", loss_feat_align.item())
@@ -477,7 +515,7 @@ class DepthMasterTrainerS1:
             valid_mask_ts = valid_mask_ts.to(self.device)
 
             # Predict depth
-            pipe_out: DepthMasterDepthOutput = self.model(
+            pipe_out: ApDepthDepthOutput = self.model(
                 rgb_int,
                 processing_res=self.cfg.validation.processing_res,
                 match_input_res=self.cfg.validation.match_input_res,
@@ -581,6 +619,18 @@ class DepthMasterTrainerS1:
                 f"Global seed sequence is generated, length={len(self.global_seed_sequence)}"
             )
         return self.global_seed_sequence.pop()
+
+    def _resolve_ckpt_path(self, path):
+        candidates = [path]
+        if not os.path.isabs(path):
+            candidates.append(os.path.join(self.base_ckpt_dir, path))
+
+        for candidate in candidates:
+            if os.path.exists(candidate):
+                return candidate
+
+        checked = ", ".join(candidates)
+        raise FileNotFoundError(f"Checkpoint not found. Checked: {checked}")
 
     def save_checkpoint(self, ckpt_name, save_train_state):
         ckpt_dir = os.path.join(self.out_dir_ckpt, ckpt_name)
